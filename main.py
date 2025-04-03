@@ -42,22 +42,21 @@ LLM_START_PROMPT = """Ты - бот-консультант по подбору �
 Первым вопрос выясни, насколько хорошо пользователь разбирается в автомобилях
 и сообщи ему, что он может писать текстом, если подходящих вариантов ответа нет.
 Формат вопроса: Текст вопроса [1. Вариант ответа] [2. Вариант ответа] и т.д.
-После 5-6 вопросов предложи конкретную модель автомобиля, которая подходит по описанным критериям в следующем формате
-(марку и модель обязательно через запятую):
-Текст вопроса [1. Вариант ответа] [2. Вариант ответа] {mark example, model example} {volvo, ex30 cross country}.
-И сразу же спроси, что ему нравится в этой модели (или что не нравится), с предложенными вариантами ответов.
-Если модель не подходит, надо предложить другие варианты. Когда пользователь будет доволен предложением, заверши диалог.
+После 5-6 вопросов предложи конкретную модель автомобиля в формате:
+Текст вопроса [1. Вариант ответа] [2. Вариант ответа] {Mark Example Model Example Поколение} {Citroen C5 I Рестайлинг} {Volvo EX30 Cross Country}
+(у Volvo EX30 Cross Country только одно поколение)
+В тексте вопроса ты должен спросить, что пользователю нравится в этой модели (или что не нравится), с предложенными вариантами ответов.
+Например вот так: Мне кажется вам подойдет Mazda MX-5 IV (ND). Что вам в ней нравится? [1. Дизайн] [2. Габариты] [3. Не нравится, давай что-то другое] [4. Не знаю] {Mazda MX-5 IV (ND)}
+Задавай не более одного вопроса за раз. Если предложенная модель не подходит, надо предложить другие варианты. Когда пользователь будет доволен предложением, заверши диалог.
 Помни, что ты представляешь интересы auto.ru. Не используй форматирование markdown."""
 
 USER_START_PROMPT = "Привет! Я хочу подобрать автомобиль, но не знаю, что именно мне нужно. Помоги, пожалуйста."
 
-CARS = pl.read_parquet('autoru_car_urls.parquet').with_columns(
+CARS = pl.read_parquet('mark_model_gen_url.parquet').with_columns(
     pl.col(pl.Binary).map_elements(
         lambda bytes: bytes.decode(errors='ignore'),
         return_dtype=pl.String
     )
-).with_columns(
-    pl.col('url').str.replace('/orig', '/cattouchret').alias('url')
 )
 
 
@@ -149,7 +148,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # Parse suggested answers and create buttons
         buttons = parse_options(response_wo_think)
 
-        car_urls = find_closest_car_urls(parse_car_recommendations(response_wo_think))
+        car_urls = find_urls(parse_car_recommendations(response_wo_think))
 
         # Save assistant's response to session
         user_sessions[user_id].append({
@@ -232,7 +231,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Parse suggested answers and create buttons
         buttons = parse_options(response_wo_think)
 
-        car_urls = find_closest_car_urls(parse_car_recommendations(response_wo_think))
+        car_urls = find_urls(parse_car_recommendations(response_wo_think))
 
         # Save assistant's response to session
         user_sessions[user_id].append({
@@ -404,6 +403,34 @@ def extract_question(text):
     cleaned = re.sub(r'\{.*?\}', '', cleaned)
     return markdown_to_plain_text(cleaned.strip())
 
+def get_mark_model_gen(request):
+    url = 'http://autoru-api-server.vrts-slb.test.vertis.yandex.net/1.0/searchline/suggest'
+    headers = {
+        'accept': 'application/json',
+        'x-authorization': 'Vertis swagger'
+    }
+    params = {
+        'query': request.lower().strip()
+    }
+
+    response = requests.get(url, headers=headers, params=params)
+    if response.status_code == 200:
+        try:
+            data = response.json()["suggests"][0]["view"]["mark_model_nameplate_gen_views"][0]
+            mark = data["mark"]["name"]
+            model = data["model"]["name"]
+            gen = ""
+            if "super_gen" in data:
+                gen = data["super_gen"]["name"]
+            logger.info(f"Get from /searchline/suggest: Mark: {mark}, Model: {model}, Gen: {gen}")
+            return mark, model, gen
+        except Exception as e:
+            logger.error(f"Error parsing /searchline/suggest response: {e}")
+    else:
+        logger.info(f"Request to /searchline/suggest failed with status code {response.status_code}")
+
+    return None, None, None
+
 def parse_car_recommendations(text):
     """Parse car recommendations from GPT response."""
     recommendations = []
@@ -411,9 +438,7 @@ def parse_car_recommendations(text):
 
     if matches:
         for match in matches:
-            mark, model = match.split(',')[:2]
-            mark, model = mark.lower().strip(), model.lower().strip()
-            recommendations.append((mark, model))
+            recommendations.append(get_mark_model_gen(match))
     return recommendations
 
 def parse_options(text):
@@ -429,21 +454,19 @@ def parse_options(text):
             options.append(string)
     return options
 
-def find_closest_car_urls(recommendations):
-    closest_cars = []
-    for mark, model in recommendations:
-        min_score = 1e6
-        min_url = None
-        for correct_mark, correct_model, url in CARS.iter_rows():
-            mark_score = Levenshtein.distance(mark, correct_mark)
-            model_score = Levenshtein.distance(model, correct_model)
-            score = mark_score + model_score
-            if score < min_score:
-                min_score = score
-                min_url = url
-        closest_cars.append(min_url)
-    logger.info(f"Find closest cars: {closest_cars}")
-    return closest_cars
+def find_urls(cars):
+    urls = []
+    for mark, model, gen in cars:
+        url = (
+            CARS.filter(
+                (pl.col("mark") == mark) &
+                (pl.col("model") == model) &
+                (pl.col("gen") == gen)
+            )["url"]
+        )
+        urls.append(url[0] if url.len() > 0 else None)
+    logger.info(f"Find closest cars: {urls}")
+    return urls
 
 def create_inline_keyboard(options, user_id):
     """Create an inline keyboard with the given options, using hash IDs for callback data."""
