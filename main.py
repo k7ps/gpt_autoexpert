@@ -5,12 +5,16 @@ import requests
 import re
 import hashlib
 import asyncio
+import polars as pl
 from markdown import markdown
 from bs4 import BeautifulSoup
+import Levenshtein
+from io import BytesIO
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ChatAction
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram.constants import ChatAction, ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from telegram.error import BadRequest
 
 # Set up logging
 logging.basicConfig(
@@ -34,15 +38,27 @@ processing_requests = {}
 LLM_START_PROMPT = """Ты - бот-консультант по подбору автомобиля сайта auto.ru.
 Твоя задача - помочь пользователю выбрать автомобиль, который подходит его потребностям.
 Задавай по одному вопросу за раз. Каждый вопрос должен содержать варианты ответов (не более 7 вариантов).
-Обязательно включай вариант "Не знаю". Формат ответа: Текст вопроса [1. Вариант ответа] [2. Вариант ответа] и т.д.
-Общайся с пользователем только на русском языке. Первым вопрос выясни, насколько хорошо пользователь разбирается в автомобилях
+Обязательно включай вариант "Не знаю". Общайся с пользователем только на русском языке.
+Первым вопрос выясни, насколько хорошо пользователь разбирается в автомобилях
 и сообщи ему, что он может писать текстом, если подходящих вариантов ответа нет.
-После 5-6 вопросов предложи конкретную модель автомобиля, которая подходит по описанным критериям.
+Формат вопроса: Текст вопроса [1. Вариант ответа] [2. Вариант ответа] и т.д.
+После 5-6 вопросов предложи конкретную модель автомобиля, которая подходит по описанным критериям в следующем формате
+(марку и модель обязательно через запятую):
+Текст вопроса [1. Вариант ответа] [2. Вариант ответа] {mark example, model example} {volvo, ex30 cross country}.
 И сразу же спроси, что ему нравится в этой модели (или что не нравится), с предложенными вариантами ответов.
 Если модель не подходит, надо предложить другие варианты. Когда пользователь будет доволен предложением, заверши диалог.
-Помни, что ты представляешь интересы auto.ru"""
+Помни, что ты представляешь интересы auto.ru. Не используй форматирование markdown."""
 
 USER_START_PROMPT = "Привет! Я хочу подобрать автомобиль, но не знаю, что именно мне нужно. Помоги, пожалуйста."
+
+CARS = pl.read_parquet('autoru_car_urls.parquet').with_columns(
+    pl.col(pl.Binary).map_elements(
+        lambda bytes: bytes.decode(errors='ignore'),
+        return_dtype=pl.String
+    )
+).with_columns(
+    pl.col('url').str.replace('/orig', '/cattouchret').alias('url')
+)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -80,13 +96,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "content": response_text
     })
 
-    intro = extract_question(response_wo_think)
+    question = extract_question(response_wo_think)
 
     if buttons:
         keyboard = create_inline_keyboard(buttons, user_id)
-        await update.message.reply_text(intro, reply_markup=keyboard)
+        await update.message.reply_text(question, reply_markup=keyboard)
     else:
-        await update.message.reply_text(intro)
+        await update.message.reply_text(question)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle user messages."""
@@ -126,10 +142,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         # Get response from GPT
         response_text = await get_gpt_response(user_id)
+        typing_task.cancel()
+
         response_wo_think = remove_think_section(response_text)
 
         # Parse suggested answers and create buttons
         buttons = parse_options(response_wo_think)
+
+        car_urls = find_closest_car_urls(parse_car_recommendations(response_wo_think))
 
         # Save assistant's response to session
         user_sessions[user_id].append({
@@ -137,13 +157,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "content": response_text
         })
 
-        intro = extract_question(response_wo_think)
+        question = extract_question(response_wo_think)
 
-        if buttons:
-            keyboard = create_inline_keyboard(buttons, user_id)
-            await update.message.reply_text(intro, reply_markup=keyboard)
-        else:
-            await update.message.reply_text(intro)
+        await send_combined_message(context, update.message.chat.id, question, car_urls, buttons, user_id)
 
     finally:
         # Mark user as not processing
@@ -189,6 +205,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         logger.error(f"Error updating keyboard: {e}")
 
     try:
+        await query.message.chat.send_action(ChatAction.TYPING)
+
         # Retrieve the original option from the callback data map
         if callback_id in callback_data_map:
             user_message = callback_data_map[callback_id]
@@ -204,11 +222,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         })
 
         # Get response from GPT
+        typing_task = asyncio.create_task(show_typing_repeatedly(query.message.chat))
+
         response_text = await get_gpt_response(user_id)
+        typing_task.cancel()
+
         response_wo_think = remove_think_section(response_text)
 
         # Parse suggested answers and create buttons
         buttons = parse_options(response_wo_think)
+
+        car_urls = find_closest_car_urls(parse_car_recommendations(response_wo_think))
 
         # Save assistant's response to session
         user_sessions[user_id].append({
@@ -216,26 +240,112 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "content": response_text
         })
 
-        intro = extract_question(response_wo_think)
+        question = extract_question(response_wo_think)
 
+        # Try to delete the original message
         try:
-            if buttons:
-                keyboard = create_inline_keyboard(buttons, user_id)
-                await query.edit_message_text(text=intro, reply_markup=keyboard)
-            else:
-                await query.edit_message_text(text=intro)
+            await query.message.delete()
         except Exception as e:
-            logger.error(f"Error updating message: {e}")
-            # Send a new message instead of editing
-            if buttons:
-                keyboard = create_inline_keyboard(buttons, user_id)
-                await query.message.reply_text(text=intro, reply_markup=keyboard)
-            else:
-                await query.message.reply_text(text=intro)
+            logger.error(f"Error deleting message: {e}")
+
+        # Send a new combined message
+        await send_combined_message(context, query.message.chat.id, question, car_urls, buttons, user_id)
 
     finally:
         # Mark user as not processing
         processing_requests[user_id] = False
+
+async def send_combined_message(context, chat_id, text, car_urls, buttons, user_id):
+    """
+    Send a single message with text, car images, and buttons.
+
+    Args:
+        context: The context object from the handler function
+        chat_id: Telegram chat ID
+        text: The text message from GPT
+        car_urls: List of car URLs
+        buttons: List of button options
+        user_id: User ID for creating keyboard
+    """
+    try:
+        # Create keyboard if buttons are available
+        keyboard = create_inline_keyboard(buttons, user_id) if buttons else None
+
+        # If no cars found, just send the text with buttons
+        if len(car_urls) == 0:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        # Prepare message with images
+        media = []
+        for i, url in enumerate(car_urls):
+
+            # Try to download image
+            try:
+                response = requests.get(url)
+                if response.status_code == 200:
+                    # First car image becomes the main photo with caption
+                    if i == 0:
+                        media.append(InputMediaPhoto(
+                            media=BytesIO(response.content),
+                            caption=text,
+                            parse_mode=ParseMode.HTML
+                        ))
+                    else:
+                        media.append(InputMediaPhoto(
+                            media=BytesIO(response.content)
+                        ))
+            except Exception as e:
+                logger.error(f"Error downloading image {url}")
+
+        # If we couldn't get any images, fall back to text only
+        if not media:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        # Send media group first
+        sent_messages = await context.bot.send_media_group(
+            chat_id=chat_id,
+            media=media
+        )
+
+        # Then send keyboard separately if needed
+        if keyboard:
+            # The caption is attached to the first photo, so we don't need to repeat it
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Выберите один из вариантов:",
+                reply_markup=keyboard
+            )
+
+    except BadRequest as e:
+        logger.error(f"Telegram API error sending message: {e}")
+        # Fallback - send without media
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML
+        )
+
+    except Exception as e:
+        logger.error(f"Error sending combined message: {e}")
+        # Extra fallback - simplest message possible
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"{text}\n\nК сожалению, не удалось загрузить изображения автомобилей.",
+            reply_markup=keyboard
+        )
 
 async def get_gpt_response(user_id):
     """Get a response from LLM using the conversation history."""
@@ -290,8 +400,21 @@ def markdown_to_plain_text(markdown_text):
     return plain_text
 
 def extract_question(text):
-    cleaned = markdown_to_plain_text(re.sub(r'\[.*?\]', '', text).strip())
-    return cleaned
+    cleaned = re.sub(r'\[.*?\]', '', text)
+    cleaned = re.sub(r'\{.*?\}', '', cleaned)
+    return markdown_to_plain_text(cleaned.strip())
+
+def parse_car_recommendations(text):
+    """Parse car recommendations from GPT response."""
+    recommendations = []
+    matches = re.findall(r'\{([^{}]*)\}', text)
+
+    if matches:
+        for match in matches:
+            mark, model = match.split(',')[:2]
+            mark, model = mark.lower().strip(), model.lower().strip()
+            recommendations.append((mark, model))
+    return recommendations
 
 def parse_options(text):
     """Parse options from GPT response to create buttons."""
@@ -305,6 +428,22 @@ def parse_options(text):
                 string = string[:64]
             options.append(string)
     return options
+
+def find_closest_car_urls(recommendations):
+    closest_cars = []
+    for mark, model in recommendations:
+        min_score = 1e6
+        min_url = None
+        for correct_mark, correct_model, url in CARS.iter_rows():
+            mark_score = Levenshtein.distance(mark, correct_mark)
+            model_score = Levenshtein.distance(model, correct_model)
+            score = mark_score + model_score
+            if score < min_score:
+                min_score = score
+                min_url = url
+        closest_cars.append(min_url)
+    logger.info(f"Find closest cars: {closest_cars}")
+    return closest_cars
 
 def create_inline_keyboard(options, user_id):
     """Create an inline keyboard with the given options, using hash IDs for callback data."""
