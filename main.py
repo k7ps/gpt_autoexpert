@@ -1,5 +1,4 @@
 import os
-import json
 import logging
 import requests
 import re
@@ -8,8 +7,8 @@ import asyncio
 import polars as pl
 from markdown import markdown
 from bs4 import BeautifulSoup
-import Levenshtein
 from io import BytesIO
+import random
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.constants import ChatAction, ParseMode
@@ -35,20 +34,21 @@ callback_data_map = {}
 processing_requests = {}
 
 
-LLM_START_PROMPT = """Ты - бот-консультант по подбору автомобиля сайта auto.ru.
+LLM_START_PROMPT = """Ты - бот-консультантка по подбору автомобиля сайта auto.ru. Нельзя упоминать другие площадки.
 Твоя задача - помочь пользователю выбрать автомобиль, который подходит его потребностям.
 Задавай по одному вопросу за раз. Каждый вопрос должен содержать варианты ответов (не более 7 вариантов).
-Обязательно включай вариант "Не знаю". Общайся с пользователем только на русском языке.
-Первым вопрос выясни, насколько хорошо пользователь разбирается в автомобилях
-и сообщи ему, что он может писать текстом, если подходящих вариантов ответа нет.
+Обязательно включай вариант "Не знаю" и говори пользователю, что он может писать текстом в свободной форме.
+Общайся с пользователем только на русском языке. Первым вопрос выясни, насколько хорошо пользователь разбирается в автомобилях.
+Также обязательно спроси про бюджет. Скажи, что пользователь может в свободной форме описать требования.
 Формат вопроса: Текст вопроса [1. Вариант ответа] [2. Вариант ответа] и т.д.
-После 5-6 вопросов предложи конкретную модель автомобиля в формате:
-Текст вопроса [1. Вариант ответа] [2. Вариант ответа] {Mark Example Model Example Поколение} {Citroen C5 I Рестайлинг} {Volvo EX30 Cross Country}
-(у Volvo EX30 Cross Country только одно поколение)
+После 5-6 вопросов предложи конкретную модель автомобиля в формате (год не надо указывать):
+Текст вопроса [1. Вариант ответа] [2. Вариант ответа] {Citroen C5 I Рестайлинг} {Volvo EX30 Cross Country}
+Строго придерживайся данного порядка, вначале текст, потом варианты ответа, потом марки моделей.
+Указанные модели в фигурных скобках, дублируй в тексте вопроса (текст в фигурных скобках пользователь не видит)
 В тексте вопроса ты должен спросить, что пользователю нравится в этой модели (или что не нравится), с предложенными вариантами ответов.
-Например вот так: Мне кажется вам подойдет Mazda MX-5 IV (ND). Что вам в ней нравится? [1. Дизайн] [2. Габариты] [3. Не нравится, давай что-то другое] [4. Не знаю] {Mazda MX-5 IV (ND)}
-Задавай не более одного вопроса за раз. Если предложенная модель не подходит, надо предложить другие варианты. Когда пользователь будет доволен предложением, заверши диалог.
-Помни, что ты представляешь интересы auto.ru. Не используй форматирование markdown."""
+Если предложенная модель не подходит, надо предложить другие варианты. Когда пользователь будет доволен предложением, заверши диалог.
+Не используй форматирование markdown. На российском рынке цены в среднем на 30% выше от тех, что ты знаешь.
+Задавай строго НЕ более одного вопроса в сообщении."""
 
 USER_START_PROMPT = "Привет! Я хочу подобрать автомобиль, но не знаю, что именно мне нужно. Помоги, пожалуйста."
 
@@ -66,11 +66,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_sessions[user_id] = []
 
     # Initial system prompt to set the context
-    system_message = {
-        "role": "system",
-        "content": LLM_START_PROMPT
-    }
-    user_sessions[user_id].append(system_message)
+    # system_message = {
+    #     "role": "system",
+    #     "content": LLM_START_PROMPT
+    # }
+    # user_sessions[user_id].append(system_message)
 
     # Show the bot is typing
     await update.message.chat.send_action(ChatAction.TYPING)
@@ -122,13 +122,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     try:
         # Initialize session if not exists
-        if user_id not in user_sessions:
-            user_sessions[user_id] = []
-            system_message = {
-                "role": "system",
-                "content": LLM_START_PROMPT
-            }
-            user_sessions[user_id].append(system_message)
+        # if user_id not in user_sessions:
+        #     user_sessions[user_id] = []
+        #     system_message = {
+        #         "role": "system",
+        #         "content": LLM_START_PROMPT
+        #     }
+        #     user_sessions[user_id].append(system_message)
 
         # Add user message to the conversation history
         user_sessions[user_id].append({
@@ -282,8 +282,7 @@ async def send_combined_message(context, chat_id, text, car_urls, buttons, user_
 
         # Prepare message with images
         media = []
-        for i, url in enumerate(car_urls):
-
+        for i, url in enumerate([u for u in car_urls if u is not None]):
             # Try to download image
             try:
                 response = requests.get(url)
@@ -349,12 +348,22 @@ async def send_combined_message(context, chat_id, text, car_urls, buttons, user_
 async def get_gpt_response(user_id):
     """Get a response from LLM using the conversation history."""
     # url = "http://api.eliza.yandex.net/openai/v1/chat/completions"  # chatgpt
-    url = "http://api.eliza.yandex.net/together/v1/chat/completions"  # deepseek
+    # url = "http://api.eliza.yandex.net/together/v1/chat/completions"  # deepseek
+    url = "http://api.eliza.yandex.net/anthropic/v1/messages" # claude
 
     payload = {
         # "model": "gpt-4o",
-        "model": "deepseek-ai/deepseek-r1",
-        "messages": user_sessions[user_id]
+        # "model": "deepseek-ai/deepseek-r1",
+        "model": "claude-3-7-sonnet-20250219",
+        # "model": "claude-3-7-sonnet-latest",
+        # "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 12000,
+        "thinking": {
+            "budget_tokens": 8192,
+            "type": "enabled"
+        },
+        "messages": user_sessions[user_id],
+        "system": LLM_START_PROMPT
     }
 
     headers = {
@@ -366,10 +375,21 @@ async def get_gpt_response(user_id):
         response = requests.post(url, json=payload, headers=headers)
         response_json = response.json()
 
-        if 'response' in response_json and 'choices' in response_json['response']:
-            message_content = response_json['response']['choices'][0]['message']['content']
-            logger.info(f"LLM response:\n{message_content}")
-            return message_content
+        if 'response' in response_json and 'content' in response_json['response']:
+            # message_content = response_json['response']['choices'][0]['message']['content']
+            # logger.info(f"LLM response:\n{message_content}")
+            # return message_content
+
+            content = response_json["response"]["content"]
+            thinking = ""
+            text = ""
+            for i in content:
+                if i["type"] == "thinking":
+                    thinking = "<think> " + i["thinking"] + " </think>\n"
+                elif i["type"] == "text":
+                    text = i["text"]
+            logger.info(f"LLM response:\n{thinking + text}")
+            return thinking + text
         else:
             logger.error(f"Unexpected response format: {response_json}")
             return "Извините, произошла ошибка при обработке вашего запроса. Пожалуйста, попробуйте еще раз."
@@ -422,6 +442,9 @@ def get_mark_model_gen(request):
             gen = ""
             if "super_gen" in data:
                 gen = data["super_gen"]["name"]
+
+            if mark == "CHERY": mark = "Chery"
+
             logger.info(f"Get from /searchline/suggest: Mark: {mark}, Model: {model}, Gen: {gen}")
             return mark, model, gen
         except Exception as e:
@@ -457,6 +480,8 @@ def parse_options(text):
 def find_urls(cars):
     urls = []
     for mark, model, gen in cars:
+        if mark is None or model is None:
+            urls.append(None)
         url = (
             CARS.filter(
                 (pl.col("mark") == mark) &
@@ -464,7 +489,16 @@ def find_urls(cars):
                 (pl.col("gen") == gen)
             )["url"]
         )
-        urls.append(url[0] if url.len() > 0 else None)
+        url = url[0] if url.len() > 0 else None
+        if url is None:
+            url = (
+                CARS.filter(
+                    (pl.col("mark") == mark) &
+                    (pl.col("model") == model)
+                )["url"]
+            )
+            url = url[0] if url.len() > 0 else None
+        urls.append(url)
     logger.info(f"Find closest cars: {urls}")
     return urls
 
