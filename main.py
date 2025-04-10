@@ -9,6 +9,7 @@ from markdown import markdown
 from bs4 import BeautifulSoup
 from io import BytesIO
 import random
+from openai import OpenAI
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.constants import ChatAction, ParseMode
@@ -18,13 +19,22 @@ from telegram.error import BadRequest
 # Set up logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler('app.log'),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
 # Get token from environment variable
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-SOY_TOKEN = os.environ.get("SOY_TOKEN")
+SOY_TOKENS = [
+    ("Andrei",  "y1__xDrgtSRpdT-ARiuKyDXv9YC2lQSoraed4xrQdlPxsbbd1WyCAk"),
+    ("Timur",   "y1__xD17OORpdT-ARiuKyD_gtcCKQRYzH4pGoTx9599jonL7hA_GzQ"),
+    ("Aleksei", "y1__xDekK-RpdT-ARiuKyDnsNcCpHhOIrvWOiopF1mchLRNsfvf59c"),
+]
+CURR_SOY_TOKEN_IDX = 0
 
 # Dictionary to store conversation history for each user
 user_sessions = {}
@@ -83,7 +93,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_sessions[user_id].append(initial_prompt)
 
     # Get response from GPT
-    response_text = await get_gpt_response(user_id)
+    response_text = await get_gpt_response_from_aitunnel(user_id)
     response_wo_think = remove_think_section(response_text)
 
     # Parse suggested answers and create buttons
@@ -140,7 +150,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         typing_task = asyncio.create_task(show_typing_repeatedly(update.message.chat))
 
         # Get response from GPT
-        response_text = await get_gpt_response(user_id)
+        response_text = await get_gpt_response_from_aitunnel(user_id)
         typing_task.cancel()
 
         response_wo_think = remove_think_section(response_text)
@@ -223,7 +233,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Get response from GPT
         typing_task = asyncio.create_task(show_typing_repeatedly(query.message.chat))
 
-        response_text = await get_gpt_response(user_id)
+        response_text = await get_gpt_response_from_aitunnel(user_id)
         typing_task.cancel()
 
         response_wo_think = remove_think_section(response_text)
@@ -282,7 +292,7 @@ async def send_combined_message(context, chat_id, text, car_urls, buttons, user_
 
         # Prepare message with images
         media = []
-        for i, url in enumerate([u for u in car_urls if u is not None]):
+        for i, url in enumerate(list(set([u for u in car_urls if u is not None]))):
             # Try to download image
             try:
                 response = requests.get(url)
@@ -345,8 +355,14 @@ async def send_combined_message(context, chat_id, text, car_urls, buttons, user_
             reply_markup=keyboard
         )
 
-async def get_gpt_response(user_id):
+async def get_gpt_response_from_eliza(user_id, call_count=0):
     """Get a response from LLM using the conversation history."""
+    global CURR_SOY_TOKEN_IDX
+
+    if call_count >= len(SOY_TOKENS):
+        logger.error("All tokens are banned(")
+        return "Извините, все апи токены были заблокированы. В течение 5 минут должны разбанить (наверно)"
+
     # url = "http://api.eliza.yandex.net/openai/v1/chat/completions"  # chatgpt
     # url = "http://api.eliza.yandex.net/together/v1/chat/completions"  # deepseek
     url = "http://api.eliza.yandex.net/anthropic/v1/messages" # claude
@@ -367,7 +383,7 @@ async def get_gpt_response(user_id):
     }
 
     headers = {
-        "authorization": f"OAuth {SOY_TOKEN}",
+        "authorization": f"OAuth {SOY_TOKENS[CURR_SOY_TOKEN_IDX][1]}",
         "content-type": "application/json"
     }
 
@@ -388,8 +404,14 @@ async def get_gpt_response(user_id):
                     thinking = "<think> " + i["thinking"] + " </think>\n"
                 elif i["type"] == "text":
                     text = i["text"]
-            logger.info(f"LLM response:\n{thinking + text}")
+            logger.info(f"LLM response from {SOY_TOKENS[CURR_SOY_TOKEN_IDX][0]}'s token:\n{thinking + text}")
             return thinking + text
+        elif 'response' in response_json and 'error' in response_json['response']:
+            logger.error(f"Error getting GPT response from {SOY_TOKENS[CURR_SOY_TOKEN_IDX][0]}'s token: {response_json}")
+            CURR_SOY_TOKEN_IDX = (CURR_SOY_TOKEN_IDX + 1) % len(SOY_TOKENS)
+            logger.info(f"Switched to {SOY_TOKENS[CURR_SOY_TOKEN_IDX][0]}'s token")
+            response_text = await get_gpt_response_from_eliza(user_id, call_count=call_count+1)
+            return response_text
         else:
             logger.error(f"Unexpected response format: {response_json}")
             return "Извините, произошла ошибка при обработке вашего запроса. Пожалуйста, попробуйте еще раз."
@@ -397,6 +419,54 @@ async def get_gpt_response(user_id):
     except Exception as e:
         logger.error(f"Error getting GPT response: {e}")
         return "Извините, произошла ошибка при обработке вашего запроса. Пожалуйста, попробуйте еще раз."
+
+async def get_gpt_response_from_aitunnel(user_id):
+    """Get a response from LLM using the conversation history."""
+
+    client = OpenAI(
+        api_key="sk-aitunnel-Pvx7V5XjC93w4cF8CYGfbjFy13UvnmC9",
+        base_url="https://api.aitunnel.ru/v1/",
+    )
+
+    try:
+        chat_result = client.chat.completions.create(
+            messages=[{"role": "system", "content": LLM_START_PROMPT}] + user_sessions[user_id],
+            model="claude-3.7-sonnet-think",
+            max_tokens=12000,
+        )
+
+        message = chat_result.choices[0].message
+        reasoning = "<think> " + message.reasoning + " </think>\n"
+        content = message.content
+
+        logger.info(f"LLM response from aitunnel:\n{reasoning + content}")
+        return reasoning + content
+
+    except Exception as e:
+        logger.error(f"Error getting GPT response: {e}")
+        return "Извините, произошла ошибка при обработке вашего запроса. Пожалуйста, попробуйте еще раз."
+
+"""
+
+curl https://api.aitunnel.ru/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer sk-aitunnel-Pvx7V5XjC93w4cF8CYGfbjFy13UvnmC9" \
+    -d '{
+      "model": "claude-3.7-sonnet-think",
+      "max_tokens": 1000,
+      "messages": [
+        {
+          "role": "system",
+          "content": "Ты вспомогательный ассистент"
+        },
+        {
+          "role": "user",
+          "content": "Скажи интересный факт"
+        }
+      ]
+    }'
+
+"""
 
 async def show_typing_repeatedly(chat):
     """Show typing indicator repeatedly until the task is cancelled."""
@@ -550,3 +620,29 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+"""
+curl https://api.aitunnel.ru/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer sk-aitunnel-Pvx7V5XjC93w4cF8CYGfbjFy13UvnmC9" \
+    -d '{
+      "model": "claude-3.7-sonnet-think",
+      "max_tokens": 2000,
+      "thinking": {
+            "budget_tokens": 1000,
+            "type": "enabled"
+        },
+      "messages": [
+        {
+          "role": "user",
+          "content": "Скажи интересный факт"
+        }
+      ]
+      "system": "Ты вспомогательный ассистент"
+    }'
+
+
+
+
+"""
