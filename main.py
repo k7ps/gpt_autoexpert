@@ -30,9 +30,7 @@ logger = logging.getLogger(__name__)
 # Get token from environment variable
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 SOY_TOKENS = [
-    ("Andrei",  "y1__xDrgtSRpdT-ARiuKyDXv9YC2lQSoraed4xrQdlPxsbbd1WyCAk"),
-    ("Timur",   "y1__xD17OORpdT-ARiuKyD_gtcCKQRYzH4pGoTx9599jonL7hA_GzQ"),
-    ("Aleksei", "y1__xDekK-RpdT-ARiuKyDnsNcCpHhOIrvWOiopF1mchLRNsfvf59c"),
+    ("Default", os.environ.get("SOY_TOKEN"))
 ]
 CURR_SOY_TOKEN_IDX = 0
 
@@ -74,13 +72,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a message when the command /start is issued."""
     user_id = update.effective_user.id
     user_sessions[user_id] = []
-
-    # Initial system prompt to set the context
-    # system_message = {
-    #     "role": "system",
-    #     "content": LLM_START_PROMPT
-    # }
-    # user_sessions[user_id].append(system_message)
 
     # Show the bot is typing
     await update.message.chat.send_action(ChatAction.TYPING)
@@ -131,15 +122,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.chat.send_action(ChatAction.TYPING)
 
     try:
-        # Initialize session if not exists
-        # if user_id not in user_sessions:
-        #     user_sessions[user_id] = []
-        #     system_message = {
-        #         "role": "system",
-        #         "content": LLM_START_PROMPT
-        #     }
-        #     user_sessions[user_id].append(system_message)
-
         # Add user message to the conversation history
         user_sessions[user_id].append({
             "role": "user",
@@ -201,7 +183,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         new_row = []
         for button in row:
             if button.callback_data == callback_id:
-                # selected_option = button.text
                 new_row.append(InlineKeyboardButton(f"⏳ {button.text}", callback_data=button.callback_data))
             else:
                 new_row.append(button)
@@ -363,16 +344,10 @@ async def get_gpt_response_from_eliza(user_id, call_count=0):
         logger.error("All tokens are banned(")
         return "Извините, все апи токены были заблокированы. В течение 5 минут должны разбанить (наверно)"
 
-    # url = "http://api.eliza.yandex.net/openai/v1/chat/completions"  # chatgpt
-    # url = "http://api.eliza.yandex.net/together/v1/chat/completions"  # deepseek
     url = "http://api.eliza.yandex.net/anthropic/v1/messages" # claude
 
     payload = {
-        # "model": "gpt-4o",
-        # "model": "deepseek-ai/deepseek-r1",
         "model": "claude-3-7-sonnet-20250219",
-        # "model": "claude-3-7-sonnet-latest",
-        # "model": "claude-3-5-sonnet-20241022",
         "max_tokens": 12000,
         "thinking": {
             "budget_tokens": 8192,
@@ -392,10 +367,6 @@ async def get_gpt_response_from_eliza(user_id, call_count=0):
         response_json = response.json()
 
         if 'response' in response_json and 'content' in response_json['response']:
-            # message_content = response_json['response']['choices'][0]['message']['content']
-            # logger.info(f"LLM response:\n{message_content}")
-            # return message_content
-
             content = response_json["response"]["content"]
             thinking = ""
             text = ""
@@ -424,7 +395,7 @@ async def get_gpt_response_from_aitunnel(user_id):
     """Get a response from LLM using the conversation history."""
 
     client = OpenAI(
-        api_key="sk-aitunnel-Pvx7V5XjC93w4cF8CYGfbjFy13UvnmC9",
+        api_key="YOUR_AI_TUNNEL_API_KEY",
         base_url="https://api.aitunnel.ru/v1/",
     )
 
@@ -445,28 +416,6 @@ async def get_gpt_response_from_aitunnel(user_id):
     except Exception as e:
         logger.error(f"Error getting GPT response: {e}")
         return "Извините, произошла ошибка при обработке вашего запроса. Пожалуйста, попробуйте еще раз."
-
-"""
-
-curl https://api.aitunnel.ru/v1/chat/completions \
-    -H "Content-Type: application/json" \
-    -H "Authorization: Bearer sk-aitunnel-Pvx7V5XjC93w4cF8CYGfbjFy13UvnmC9" \
-    -d '{
-      "model": "claude-3.7-sonnet-think",
-      "max_tokens": 1000,
-      "messages": [
-        {
-          "role": "system",
-          "content": "Ты вспомогательный ассистент"
-        },
-        {
-          "role": "user",
-          "content": "Скажи интересный факт"
-        }
-      ]
-    }'
-
-"""
 
 async def show_typing_repeatedly(chat):
     """Show typing indicator repeatedly until the task is cancelled."""
@@ -620,29 +569,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-"""
-curl https://api.aitunnel.ru/v1/chat/completions \
-    -H "Content-Type: application/json" \
-    -H "Authorization: Bearer sk-aitunnel-Pvx7V5XjC93w4cF8CYGfbjFy13UvnmC9" \
-    -d '{
-      "model": "claude-3.7-sonnet-think",
-      "max_tokens": 2000,
-      "thinking": {
-            "budget_tokens": 1000,
-            "type": "enabled"
-        },
-      "messages": [
-        {
-          "role": "user",
-          "content": "Скажи интересный факт"
-        }
-      ]
-      "system": "Ты вспомогательный ассистент"
-    }'
-
-
-
-
-"""
